@@ -1,0 +1,22 @@
+
+train: ./datasets/images/train/
+val: ./datasets/images/val/
+nc: 16
+
+names: 
+  - 'rP'
+  - 'rR'
+  - 'rK'
+  - 'rN'
+  - 'rC'
+  - 'rA'
+  - 'rB'
+  - 'rX'
+  - 'bP'
+  - 'bR'
+  - 'bK'
+  - 'bN'
+  - 'bC'
+  - 'bA'
+  - 'bB'
+  - 'bX'
