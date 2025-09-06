@@ -1,6 +1,9 @@
-import pygame
 import os
+import warnings
 import sys
+warnings.filterwarnings("ignore", category=UserWarning, message=".pkg_resources is deprecated.")
+os.environ['PYGAME_HIDE_SUPPORT_PROMPT'] = '1'
+import pygame
 import subprocess
 import time
 import numpy as np
@@ -13,10 +16,23 @@ import win32con
 import json
 import tkinter as tk
 from tkinter import filedialog, messagebox
+import pyautogui
 
-CONFIDENCE_THRESHOLD = 0.90
+DEBUG_ENABLED = False
 
-BOARD_SIZE = (800, 670)
+class NullWriter:
+    """一个用于重定向流的空设备，它会忽略所有写入操作。"""
+    def write(self, s):
+        pass
+    def flush(self):
+        pass
+
+def _d_print(*args, **kwargs):
+    """全局打印函数，仅在DEBUG_ENABLED为True时输出到命令行。"""
+    if DEBUG_ENABLED:
+        print(*args, **kwargs)
+
+BOARD_SIZE = (800, 850)
 PIECE_SIZE = 64          # 棋子逻辑尺寸
 GRID_SIZE = 600 // 9
 BOARD_OFFSET = (5, 0)
@@ -24,7 +40,6 @@ BOARD_OFFSET = (5, 0)
 SETTINGS_FILE = os.path.join('resource', 'settings.json')
 
 def get_default_settings():
-    """返回默认设置字典"""
     return {
         "engine_threads": 8,
         "hash_size": 512,
@@ -32,14 +47,15 @@ def get_default_settings():
         "board_scan_interval": 0.15,
         "board_click_interval": 0.50,
         "fixed_scan_interval": 1.0,
-        "model_path": "resource/models/Moonlink_tiantian_wooden_v1.pt"
+        "model_path": "resource/models/Moonlink_tiantian_wooden_v1.pt",
+        "confidence_threshold": 0.90,
+        "use_mouse_click": 0,
+        "debug_mode": 0
     }
 
 def load_settings():
-
     if not os.path.exists(os.path.dirname(SETTINGS_FILE)):
         os.makedirs(os.path.dirname(SETTINGS_FILE))
-        
     if not os.path.exists(SETTINGS_FILE):
         settings = get_default_settings()
         with open(SETTINGS_FILE, 'w', encoding='utf-8') as f:
@@ -48,45 +64,47 @@ def load_settings():
     try:
         with open(SETTINGS_FILE, 'r', encoding='utf-8') as f:
             settings = json.load(f)
-            # 确保所有键都存在，如果缺少则用默认值补充
             defaults = get_default_settings()
             for key, value in defaults.items():
                 if key not in settings:
                     settings[key] = value
             return settings
     except (json.JSONDecodeError, FileNotFoundError):
-        print("警告: settings.json 读取失败，使用默认设置。")
+        _d_print("警告: settings.json 读取失败，使用默认设置。")
         return get_default_settings()
 
 def save_settings(settings):
-
     with open(SETTINGS_FILE, 'w', encoding='utf-8') as f:
         json.dump(settings, f, indent=4)
+    # 更新全局调试标志
+    global DEBUG_ENABLED
+    DEBUG_ENABLED = True if settings.get("debug_mode", 0) == 1 else False
 
 def show_settings_window(current_settings):
-
     window = tk.Tk()
     window.title("设置")
-    window.geometry("500x350")
+    window.geometry("500x430")
     window.resizable(False, False)
 
     entries = {}
-    
     options = {
         "engine_threads": "引擎线程:",
         "hash_size": "置换表大小 (MB):",
         "engine_think_time": "引擎思考时间 (ms):",
         "board_scan_interval": "棋盘识别间隔 (s):",
         "board_click_interval": "棋盘点击间隔 (s):",
-        "fixed_scan_interval": "固定刷新识别间隔 (s):", 
-        "model_path": "识别模型路径:"
+        "fixed_scan_interval": "固定刷新识别间隔 (s):",
+        "confidence_threshold": "置信度阈值 (0.0-1.0):",
+        "use_mouse_click": "使用鼠标点击:",
+        "debug_mode": "调试模式:",
+        "model_path": "识别模型:"
     }
-    
+
     for i, (key, label_text) in enumerate(options.items()):
         frame = tk.Frame(window)
         frame.pack(fill='x', padx=10, pady=5)
         
-        label = tk.Label(frame, text=label_text, width=20, anchor='w')
+        label = tk.Label(frame, text=label_text, width=25, anchor='w')
         label.pack(side='left')
         
         entry = tk.Entry(frame)
@@ -113,7 +131,10 @@ def show_settings_window(current_settings):
                 "board_scan_interval": float(entries["board_scan_interval"].get()),
                 "board_click_interval": float(entries["board_click_interval"].get()),
                 "fixed_scan_interval": float(entries["fixed_scan_interval"].get()),
-                "model_path": entries["model_path"].get()
+                "model_path": entries["model_path"].get(),
+                "confidence_threshold": float(entries["confidence_threshold"].get()),
+                "use_mouse_click": int(entries["use_mouse_click"].get()),
+                "debug_mode": int(entries["debug_mode"].get())
             }
             save_settings(new_settings)
             messagebox.showinfo("成功", "设置已保存！部分设置将在程序重启后生效。")
@@ -125,7 +146,7 @@ def show_settings_window(current_settings):
 
     button_frame = tk.Frame(window)
     button_frame.pack(pady=20)
-    
+
     save_button = tk.Button(button_frame, text="保存", command=on_save, width=10)
     save_button.pack(side='left', padx=10)
 
@@ -138,23 +159,25 @@ class EngineCommunicationError(Exception):
     pass
 
 def get_main_window_handle(hwnd):
+    """获取窗口的顶级父句柄"""
     while win32gui.GetParent(hwnd):
         hwnd = win32gui.GetParent(hwnd)
     return hwnd
 
-
 def select_board_roi():
-
+    """让用户通过截图和拖拽选择棋盘区域"""
     pygame.init()
-
     info = pygame.display.Info()
     screen_width, screen_height = info.current_w, info.current_h
     screen = pygame.display.set_mode((screen_width, screen_height), pygame.NOFRAME | pygame.FULLSCREEN)
+    
     with mss.mss() as sct:
         monitor = sct.monitors[0]
         sct_img = sct.grab(monitor)
         frame = pygame.image.frombytes(sct_img.rgb, sct_img.size, "RGB")
+    
     screen.blit(frame, (0, 0))
+    
     try:
         font = pygame.font.SysFont('Microsoft YaHei', 24)
     except:
@@ -211,7 +234,7 @@ def select_board_roi():
     if rect:
         return {'top': rect.y, 'left': rect.x, 'width': rect.width, 'height': rect.height}
     else:
-        print("未选择任何区域，程序退出。")
+        _d_print("未选择任何区域，程序退出。")
         sys.exit()
 
 class BoardDisplay:
@@ -220,37 +243,38 @@ class BoardDisplay:
         self.screen = pygame.display.set_mode(BOARD_SIZE)
         pygame.display.set_caption("Moonlink")
         self.piece_images = {}
+        self.small_piece_images = {}
         self.board_img = None
         self.donate_img = None
-
+        
         try:
             self.font = pygame.font.SysFont('Microsoft YaHei', 24)
             self.button_font = pygame.font.SysFont('Microsoft YaHei', 22)
+            self.small_font = pygame.font.SysFont('Microsoft YaHei', 18)
         except:
             self.font = pygame.font.SysFont('sans', 24)
             self.button_font = pygame.font.SysFont('sans', 22)
+            self.small_font = pygame.font.SysFont('sans', 18)
+
 
         self.engine_depth = ""
         self.engine_score = ""
         
-        self.settings_button_rect = pygame.Rect(620, BOARD_SIZE[1] - 130, 160, 50)
-        self.connect_button_rect = pygame.Rect(620, BOARD_SIZE[1] - 70, 160, 50)
+        self.settings_button_rect = pygame.Rect(620, BOARD_SIZE[1] - 310, 160, 50)
+        self.connect_button_rect = pygame.Rect(620, BOARD_SIZE[1] - 250, 160, 50)
         self.button_color = (0, 150, 0)
         self.settings_button_color = (0, 100, 150)
         self.button_text_color = (255, 255, 255)
+
+        self.dark_piece_buttons = {}
         
         self.load_images()
 
     def load_images(self):
         """加载棋盘和棋子图片"""
-        try:
-            board_path = os.path.join('resource', 'pieces', 'board.PNG')
-            original_board = pygame.image.load(board_path).convert()
-            self.board_img = pygame.transform.scale(original_board, (600, 670))
-        except pygame.error as e:
-            print(f"棋盘图片加载失败: {e}，使用默认背景。")
-            self.board_img = pygame.Surface((600, 670))
-            self.board_img.fill((220, 200, 170))
+        board_path = os.path.join('resource', 'pieces', 'board.PNG')
+        original_board = pygame.image.load(board_path).convert()
+        self.board_img = pygame.transform.scale(original_board, (600, 670))
 
         pieces = {
             'r': ['R', 'N', 'B', 'A', 'K', 'C', 'P', 'X'],
@@ -259,23 +283,19 @@ class BoardDisplay:
         for color_code, piece_list in pieces.items():
             for piece_code in piece_list:
                 key = f"{color_code}{piece_code}"
-                try:
-                    img_path = os.path.join('resource', 'pieces', f'{key}.PNG')
-                    piece_img = pygame.image.load(img_path).convert_alpha()
-                    piece_img = pygame.transform.scale(piece_img, (PIECE_SIZE, PIECE_SIZE))
-                    self.piece_images[key] = piece_img
-                except pygame.error:
-                    print(f"警告：棋子图片加载失败: {key}.PNG")
-        
-        try:
-            donate_path = os.path.join('resource', 'pieces', 'donate.jpg')
-            original_donate_img = pygame.image.load(donate_path).convert()
-            self.donate_img = pygame.transform.scale(original_donate_img, (180, 180))
-        except pygame.error as e:
-            print(f"赞助图片加载失败: {e}")
+                img_path = os.path.join('resource', 'pieces', f'{key}.PNG')
+                piece_img = pygame.image.load(img_path).convert_alpha()
+                # --- MODIFIED: 同时创建大尺寸和小尺寸的图片 ---
+                self.piece_images[key] = pygame.transform.scale(piece_img, (PIECE_SIZE, PIECE_SIZE))
+                self.small_piece_images[key] = pygame.transform.scale(piece_img, (32, 32))
+                # --- END MODIFIED ---
+                
+        donate_path = os.path.join('resource', 'pieces', 'donate.jpg')
+        original_donate_img = pygame.image.load(donate_path).convert()
+        self.donate_img = pygame.transform.scale(original_donate_img, (180, 180))
 
     def update_engine_info(self, depth, score, score_type):
-
+        """更新引擎分析信息"""
         if depth == "":
             self.engine_depth = ""
             self.engine_score = ""
@@ -292,9 +312,91 @@ class BoardDisplay:
             score_in_pawns = score / 100.0
             self.engine_score = f"{score_in_pawns:+.2f}"
 
-    def draw_captured_board(self, board_state, is_running=False):
-        """根据捕获到的board_state绘制棋盘、引擎信息和控制按钮"""
+    def draw_dark_piece_library(self, dark_pieces):
+        """在棋盘下方绘制暗子库及其控制按钮"""
+        lib_rect = pygame.Rect(0, 670, 600, BOARD_SIZE[1] - 670)
+        self.screen.fill((50, 50, 50), lib_rect)
+        pygame.draw.line(self.screen, (100, 100, 100), (0, 670), (600, 670), 2)
+
+        self.dark_piece_buttons.clear()
+
+        piece_order = ['R', 'N', 'B', 'A', 'C', 'P']
+        
+        # 绘制红方暗子
+        start_x_red = 20
+        y_pos_red = 690
+        for i, p_char in enumerate(piece_order):
+            key = f"r{p_char}"
+            count = dark_pieces.get(key, 0)
+            img = self.small_piece_images.get(key)
+            
+            x_pos = start_x_red + i * 95
+            if img:
+                self.screen.blit(img, (x_pos, y_pos_red))
+
+            # 绘制数量
+            count_surf = self.small_font.render(f"x {count}", True, (255, 200, 200))
+            self.screen.blit(count_surf, (x_pos + 40, y_pos_red + 8))
+
+            # 绘制并记录按钮区域
+            plus_rect = pygame.Rect(x_pos + 75, y_pos_red, 20, 15)
+            minus_rect = pygame.Rect(x_pos + 75, y_pos_red + 17, 20, 15)
+            pygame.draw.rect(self.screen, (0, 100, 0), plus_rect, border_radius=3)
+            pygame.draw.rect(self.screen, (100, 0, 0), minus_rect, border_radius=3)
+            plus_text = self.small_font.render("+", True, (255, 255, 255))
+            minus_text = self.small_font.render("-", True, (255, 255, 255))
+            self.screen.blit(plus_text, plus_text.get_rect(center=plus_rect.center))
+            self.screen.blit(minus_text, minus_text.get_rect(center=minus_rect.center))
+
+            self.dark_piece_buttons[(key, 'add')] = plus_rect
+            self.dark_piece_buttons[(key, 'sub')] = minus_rect
+
+        # 绘制黑方暗子
+        start_x_black = 20
+        y_pos_black = 755
+        for i, p_char in enumerate(piece_order):
+            key = f"b{p_char.upper()}"
+            count = dark_pieces.get(key, 0)
+            img = self.small_piece_images.get(key)
+            
+            x_pos = start_x_black + i * 95
+            if img:
+                self.screen.blit(img, (x_pos, y_pos_black))
+
+            count_surf = self.small_font.render(f"x {count}", True, (200, 200, 255))
+            self.screen.blit(count_surf, (x_pos + 40, y_pos_black + 8))
+            
+            plus_rect = pygame.Rect(x_pos + 75, y_pos_black, 20, 15)
+            minus_rect = pygame.Rect(x_pos + 75, y_pos_black + 17, 20, 15)
+            pygame.draw.rect(self.screen, (0, 100, 0), plus_rect, border_radius=3)
+            pygame.draw.rect(self.screen, (100, 0, 0), minus_rect, border_radius=3)
+            plus_text = self.small_font.render("+", True, (255, 255, 255))
+            minus_text = self.small_font.render("-", True, (255, 255, 255))
+            self.screen.blit(plus_text, plus_text.get_rect(center=plus_rect.center))
+            self.screen.blit(minus_text, minus_text.get_rect(center=minus_rect.center))
+
+            self.dark_piece_buttons[(key, 'add')] = plus_rect
+            self.dark_piece_buttons[(key, 'sub')] = minus_rect
+
+    def handle_dark_piece_library_click(self, pos, dark_pieces):
+        """检查点击位置是否在暗子库按钮上，并更新暗子数量"""
+        max_counts = {'R':2,'N':2,'B':2,'A':2,'C':2,'P':5}
+        for (key, action), rect in self.dark_piece_buttons.items():
+            if rect.collidepoint(pos):
+                p_char = key[1]
+                limit = max_counts[p_char]
+                if action == 'add' and dark_pieces[key] < limit:
+                    dark_pieces[key] += 1
+                elif action == 'sub' and dark_pieces[key] > 0:
+                    dark_pieces[key] -= 1
+                return True
+        return False
+
+    def draw_captured_board(self, board_state, dark_pieces, is_running=False):
+        """根据捕获到的board_state绘制棋盘、引擎信息、暗子库和控制按钮"""
+        self.screen.fill((30, 30, 30))
         self.screen.blit(self.board_img, (0, 0))
+
         for row in range(10):
             for col in range(9):
                 piece_name = board_state[row][col]
@@ -337,7 +439,8 @@ class BoardDisplay:
         button_text_surf = self.button_font.render(button_text_str, True, self.button_text_color)
         button_text_rect = button_text_surf.get_rect(center=self.connect_button_rect.center)
         self.screen.blit(button_text_surf, button_text_rect)
-
+        
+        self.draw_dark_piece_library(dark_pieces)
         pygame.display.flip()
 
 class AutoChessPlayer:
@@ -348,31 +451,35 @@ class AutoChessPlayer:
             self.yolo_model = YOLO(self.settings['model_path'])
             self.piece_names = self.yolo_model.names
         except Exception as e:
-            print(f"错误: 无法加载YOLO模型于路径 '{self.settings['model_path']}'. 错误: {e}")
-            print("请在设置中检查模型路径是否正确。程序将退出。")
+            _d_print(f"错误: 无法加载YOLO模型于路径 '{self.settings['model_path']}'. 错误: {e}")
+            _d_print("请在设置中检查模型路径是否正确。程序将退出。")
             sys.exit(1)
-
+        
         self.last_board_state = None
         self.computer_side = None # 'r' or 'b'
         
-        #用于后台点击的游戏窗口句柄
         self.hwnd = None
 
         self.current_player = 'r'
         self.game_over = False
         self.move_notations = []
         self.board_history = []
-        self.initial_fen = None
-
-        # 游戏状态: WAITING_FOR_NEW_GAME, HYPOTHESIZE_BLACK_TURN, PLAYING
+        
         self.game_state = "WAITING_FOR_NEW_GAME" 
 
         self.engine = None
         self.engine_path = os.path.join('resource', 'engine', 'engine.exe')
+        
+        self.initial_dark_pool = {
+            'rR': 2, 'rN': 2, 'rB': 2, 'rA': 2, 'rC': 2, 'rP': 5,
+            'bR': 2, 'bN': 2, 'bB': 2, 'bA': 2, 'bC': 2, 'bP': 5
+        }
+        self.dark_piece_library = self.initial_dark_pool.copy()
+        
         try:
             self.init_engine()
         except EngineCommunicationError as e:
-            print(f"FATAL: 引擎初始化失败: {e}. 程序无法启动。")
+            _d_print(f"FATAL: 引擎初始化失败: {e}. 程序无法启动。")
             sys.exit(1)
 
         self.display = BoardDisplay()
@@ -382,24 +489,51 @@ class AutoChessPlayer:
     def create_empty_board(self):
         return [['' for _ in range(9)] for _ in range(10)]
 
+    def update_library_from_board(self, board_state):
+        """根据当前棋盘上的明子来计算并更新暗子库"""
+        pool = self.initial_dark_pool.copy()
+        for r in range(10):
+            for c in range(9):
+                piece = board_state[r][c]
+                # 只计算明子 (非X和K)
+                if piece and 'X' not in piece and 'K' not in piece:
+                    if piece in pool and pool[piece] > 0:
+                        pool[piece] -= 1
+        
+        self.dark_piece_library = pool
+        _d_print("暗子库已根据当前棋盘状态更新。")
+
+    def _handle_piece_reveal(self, revealed_piece_key):
+        """
+        当一个暗子被翻开时，调用此函数来更新暗子库。
+        :param revealed_piece_key: 被翻开棋子的字符串标识，例如 'rR', 'bN'。
+        """
+        if revealed_piece_key and revealed_piece_key in self.dark_piece_library:
+            if self.dark_piece_library[revealed_piece_key] > 0:
+                self.dark_piece_library[revealed_piece_key] -= 1
+                _d_print(f"[暗子库更新] 棋子 '{revealed_piece_key}' 被翻开，剩余数量: {self.dark_piece_library[revealed_piece_key]}")
+            else:
+                _d_print(f"[警告] 尝试减少一个在暗子库中数量已为0的棋子: '{revealed_piece_key}'。这可能表示之前的识别有误。")
+
     def init_engine(self):
         """
         初始化或重新初始化UCI引擎。如果已存在引擎进程，会尝试终止它。
         """
         if self.engine:
-            print("正在终止现有引擎进程以进行重新初始化...")
+            _d_print("正在终止现有引擎进程以进行重新初始化...")
             try:
                 self.send_engine_command("quit")
                 self.engine.wait(timeout=1)
             except (EngineCommunicationError, subprocess.TimeoutExpired):
                 pass
             except Exception as e:
-                print(f"终止现有引擎时发生未知错误: {e}")
+                _d_print(f"终止现有引擎时发生未知错误: {e}")
             if self.engine.poll() is None:
-                print("强制终止旧引擎进程。")
+                _d_print("强制终止旧引擎进程。")
                 self.engine.terminate()
             self.engine = None
-        print("正在启动新的引擎进程...")
+
+        _d_print("正在启动新的引擎进程...")
         try:
             self.engine = subprocess.Popen(
                 self.engine_path,
@@ -420,11 +554,12 @@ class AutoChessPlayer:
             while time.time() - start_time < ready_timeout:
                 output = self.read_engine_output()
                 if "readyok" in output:
-                    print("引擎已准备就绪。")
+                    _d_print("引擎已准备就绪。")
                     return
                 time.sleep(0.1)
             
             raise EngineCommunicationError("引擎未能在规定时间内响应'readyok'。")
+
         except EngineCommunicationError:
             if self.engine: self.engine.terminate()
             self.engine = None
@@ -443,12 +578,12 @@ class AutoChessPlayer:
         向UCI引擎发送命令。
         """
         if self.engine and self.engine.stdin:
-            print(f"To Engine: {command}")
+            _d_print(f"To Engine: {command}")
             try:
                 self.engine.stdin.write(command + "\n")
                 self.engine.stdin.flush()
             except OSError as e:
-                print(f"ERROR: 无法向引擎发送命令 '{command}'。错误: {e}")
+                _d_print(f"ERROR: 无法向引擎发送命令 '{command}'。错误: {e}")
                 if self.engine: self.engine.terminate()
                 self.engine = None
                 raise EngineCommunicationError(f"引擎通信失败 (stdin不可用): {e}")
@@ -459,8 +594,8 @@ class AutoChessPlayer:
             self.engine = None
             raise EngineCommunicationError("引擎stdin不可用。")
 
-
     def read_engine_output(self):
+        """从引擎读取一行输出"""
         if self.engine and self.engine.stdout:
             return self.engine.stdout.readline().strip()
         return ""
@@ -474,16 +609,16 @@ class AutoChessPlayer:
             hwnd_child = win32gui.WindowFromPoint(point)
             
             if hwnd_child == 0:
-                print(f"错误：在坐标 {point} 处未找到窗口。请确保ROI完全在游戏窗口内。")
+                _d_print(f"错误：在坐标 {point} 处未找到窗口。请确保ROI完全在游戏窗口内。")
                 return False
             
             self.hwnd = get_main_window_handle(hwnd_child)
             
             window_text = win32gui.GetWindowText(self.hwnd)
-            print(f"成功绑定到游戏窗口：句柄={self.hwnd}, 标题='{window_text}'")
+            _d_print(f"成功绑定到游戏窗口：句柄={self.hwnd}, 标题='{window_text}'")
             return True
         except Exception as e:
-            print(f"查找窗口句柄时发生错误: {e}")
+            _d_print(f"查找窗口句柄时发生错误: {e}")
             self.hwnd = None
             return False
 
@@ -504,7 +639,7 @@ class AutoChessPlayer:
 
         for res in results:
             for box in res.boxes:
-                if box.conf[0] > CONFIDENCE_THRESHOLD:
+                if box.conf[0] > self.settings['confidence_threshold']:
                     x1, y1, x2, y2 = box.xyxy[0]
                     center_x = (x1 + x2) / 2
                     center_y = (y1 + y2) / 2
@@ -518,7 +653,6 @@ class AutoChessPlayer:
     def get_board_state_from_screen(self, max_retries=10):
         """
         通过连续两次识别结果是否一致来确保捕获的是静止的棋盘状态。
-        使用设置文件中的识别间隔。
         """
         delay = self.settings['board_scan_interval']
         board1 = self._capture_single_frame()
@@ -527,12 +661,13 @@ class AutoChessPlayer:
             board2 = self._capture_single_frame()
             if board1 == board2:
                 return board2
-            board1 = board2
+        board1 = board2
         
-        print("\n警告: 棋盘状态在多次尝试后仍未稳定，可能导致识别错误。")
+        _d_print("\n警告: 棋盘状态在多次尝试后仍未稳定，可能导致识别错误。")
         return board1
 
     def compare_boards(self, old_board, new_board):
+        """比较两个棋盘状态，推断出发生的移动"""
         disappeared, appeared = [], []
         for r in range(10):
             for c in range(9):
@@ -555,7 +690,7 @@ class AutoChessPlayer:
                 if new_piece[0] == 'b':
                     revealed_char = revealed_char.lower()
             return (from_pos[0], from_pos[1], from_pos[0], from_pos[1], revealed_char)
-
+        
         if len(appeared) == 1 and (len(disappeared) in [1, 2]):
             to_pos = appeared[0]['pos']
             appeared_piece = appeared[0]['piece']
@@ -587,6 +722,7 @@ class AutoChessPlayer:
         return None
 
     def move_to_uci(self, from_row, from_col, to_row, to_col, revealed_piece=''):
+        """将棋盘坐标转换为UCI移动字符串"""
         col_map = "abcdefghi"
         if self.computer_side == 'b':
             from_sq = f"{col_map[8 - from_col]}{from_row}"
@@ -597,6 +733,7 @@ class AutoChessPlayer:
         return f"{from_sq}{to_sq}{revealed_piece}"
 
     def uci_to_board_coords(self, uci_move):
+        """将UCI移动字符串转换为棋盘坐标"""
         col_map = "abcdefghi"
         from_col_engine = col_map.index(uci_move[0])
         from_row_engine = int(uci_move[1])
@@ -611,17 +748,39 @@ class AutoChessPlayer:
         return (from_row, from_col, to_row, to_col)
 
     def grid_to_screen_coords(self, row, col):
+        """将棋盘格子坐标转换为绝对屏幕坐标"""
         grid_h = self.roi['height'] / 10
         grid_w = self.roi['width'] / 9
         screen_x = self.roi['left'] + (col * grid_w) + (grid_w / 2)
         screen_y = self.roi['top'] + (row * grid_h) + (grid_h / 2)
         return screen_x, screen_y
 
-    def simulate_move_on_screen(self, uci_move):
+    def perform_move_on_screen(self, uci_move):
+        """根据设置选择并执行走棋方法"""
+        if self.settings.get('use_mouse_click', 0) == 1:
+            self.simulate_move_with_autogui(uci_move)
+        else:
+            self.simulate_move_with_postmessage(uci_move)
+            
+    def simulate_move_with_autogui(self, uci_move):
+        """使用 pyautogui 模拟鼠标点击来执行走棋"""
+        if len(uci_move) < 4: return
 
+        from_row, from_col, to_row, to_col = self.uci_to_board_coords(uci_move)
+        start_screen_x, start_screen_y = self.grid_to_screen_coords(from_row, from_col)
+        end_screen_x, end_screen_y = self.grid_to_screen_coords(to_row, to_col)
+
+        _d_print(f"执行鼠标点击: {uci_move} 从 ({int(start_screen_x)}, {int(start_screen_y)}) 到 ({int(end_screen_x)}, {int(end_screen_y)}) (屏幕坐标)")
+
+        pyautogui.click(x=start_screen_x, y=start_screen_y)
+        time.sleep(self.settings['board_click_interval'])
+        pyautogui.click(x=end_screen_x, y=end_screen_y)
+
+    def simulate_move_with_postmessage(self, uci_move):
+        """使用 PostMessage 发送后台点击消息来执行走棋"""
         if len(uci_move) < 4: return
         if not self.hwnd:
-            print("错误：未找到有效的游戏窗口句柄，无法执行走子。")
+            _d_print("错误：未找到有效的游戏窗口句柄，无法执行走子。")
             return
 
         from_row, from_col, to_row, to_col = self.uci_to_board_coords(uci_move)
@@ -632,13 +791,12 @@ class AutoChessPlayer:
         start_lParam = win32api.MAKELONG(start_client_pos[0], start_client_pos[1])
         end_lParam = win32api.MAKELONG(end_client_pos[0], end_client_pos[1])
 
-        print(f"发送后台点击: {uci_move} 从 {start_client_pos} 到 {end_client_pos} (窗口坐标)")
+        _d_print(f"发送后台点击: {uci_move} 从 {start_client_pos} 到 {end_client_pos} (窗口坐标)")
         
         win32api.PostMessage(self.hwnd, win32con.WM_LBUTTONDOWN, win32con.MK_LBUTTON, start_lParam)
         time.sleep(0.05)
         win32api.PostMessage(self.hwnd, win32con.WM_LBUTTONUP, 0, start_lParam)
         
-        # 使用设置文件中的点击间隔
         time.sleep(self.settings['board_click_interval'])
         
         win32api.PostMessage(self.hwnd, win32con.WM_LBUTTONDOWN, win32con.MK_LBUTTON, end_lParam)
@@ -646,6 +804,7 @@ class AutoChessPlayer:
         win32api.PostMessage(self.hwnd, win32con.WM_LBUTTONUP, 0, end_lParam)
 
     def is_board_state_valid(self, board_state):
+        """验证棋盘状态是否合法"""
         piece_counts = {p: 0 for p in ['rK','rA','rB','rN','rR','rC','rP','bK','bA','bB','bN','bR','bC','bP']}
         max_counts = {'rK':1,'rA':2,'rB':2,'rN':2,'rR':2,'rC':2,'rP':5,'bK':1,'bA':2,'bB':2,'bN':2,'bR':2,'bC':2,'bP':5}
         red_king_pos, black_king_pos = None, None
@@ -660,20 +819,24 @@ class AutoChessPlayer:
 
         for piece, count in piece_counts.items():
             if count > max_counts[piece]:
-                print(f"\n[Validation Error] 非法棋子数量: {piece}. 发现 {count}, 最大允许 {max_counts[piece]}.")
+                _d_print(f"\n[Validation Error] 非法棋子数量: {piece}. 发现 {count}, 最大允许 {max_counts[piece]}.")
+                self.reset_game()
                 return False
+
         if red_king_pos and not (7<=red_king_pos[0]<=9 and 3<=red_king_pos[1]<=5 or 0<=red_king_pos[0]<=2 and 3<=red_king_pos[1]<=5):
-            print(f"\n[Validation Error] 红帅位置非法: {red_king_pos}.")
+            _d_print(f"\n[Validation Error] 红帅位置非法: {red_king_pos}.")
             return False
         if black_king_pos and not (0<=black_king_pos[0]<=2 and 3<=black_king_pos[1]<=5 or 7<=black_king_pos[0]<=9 and 3<=black_king_pos[1]<=5):
-            print(f"\n[Validation Error] 黑将位置非法: {black_king_pos}.")
+            _d_print(f"\n[Validation Error] 黑将位置非法: {black_king_pos}.")
             return False
         if sum(piece_counts.values()) > 2 and (not red_king_pos or not black_king_pos):
-            print("\n[Validation Error] 棋盘上缺少将/帅。")
+            _d_print("\n[Validation Error] 棋盘上缺少将/帅。")
             return False
         return True
         
     def board_state_to_jieqi_fen(self, board_state):
+        """将棋盘状态转换为揭棋FEN字符串"""
+        if not board_state: return ""
         board_to_process = board_state
         if self.computer_side == 'b':
             flipped_rows = board_state[::-1]
@@ -698,45 +861,47 @@ class AutoChessPlayer:
             fen_parts.append(row_str)
         board_fen = "/".join(fen_parts)
 
-        pool = {'R':2,'N':2,'B':2,'A':2,'C':2,'P':5, 'r':2,'n':2,'b':2,'a':2,'c':2,'p':5}
-        for row in board_to_process:
-            for piece in row:
-                if piece and 'X' not in piece and 'K' not in piece:
-                    p_char = piece[1]
-                    key = p_char.upper() if piece[0] == 'r' else p_char.lower()
-                    if key in pool: pool[key] -= 1
-
         pool_str = ""
-        for p_char in ['R','r','N','n','B','b','A','a','C','c','P','p']:
-            count = pool.get(p_char, 0)
-            if count > 0: pool_str += f"{p_char}{count}"
+        fen_order = ['R','r','N','n','B','b','A','a','C','c','P','p']
+        
+        internal_to_fen = {
+            'rR':'R', 'bR':'r', 'rN':'N', 'bN':'n', 'rB':'B', 'bB':'b',
+            'rA':'A', 'bA':'a', 'rC':'C', 'bC':'c', 'rP':'P', 'bP':'p'
+        }
+        fen_to_internal = {v: k for k, v in internal_to_fen.items()}
+
+        for p_char in fen_order:
+            internal_key = fen_to_internal[p_char]
+            count = self.dark_piece_library.get(internal_key, 0)
+            if count > 0:
+                pool_str += f"{p_char}{count}"
         
         player_turn = 'w' if self.current_player == 'r' else 'b'
         full_fen = f"{board_fen} {player_turn} {pool_str} 0 1"
         return full_fen
 
-    def get_engine_move(self, override_fen=None):
-
+    def get_engine_move(self):
+        """从引擎获取最佳走法"""
         movetime = self.settings['engine_think_time']
-        base_fen = override_fen if override_fen else self.initial_fen
-        if not base_fen:
-            print("错误：FEN未设置，无法获取引擎走法。")
+        current_fen = self.board_state_to_jieqi_fen(self.last_board_state)
+        if not current_fen:
+            _d_print("错误：无法生成当前局面的FEN，无法获取引擎走法。")
             return None
-
-        moves_str = " ".join(self.move_notations)
-        position_cmd = f"position fen {base_fen} moves {moves_str}" if self.move_notations else f"position fen {base_fen}"
+        
+        position_cmd = f"position fen {current_fen}"
+        _d_print(f"为引擎生成了新的FEN: {current_fen}")
         
         try:
             self.send_engine_command(position_cmd)
             self.send_engine_command(f"go movetime {movetime}")
         except EngineCommunicationError:
-            print("ERROR: 无法向引擎发送 'position' 或 'go' 命令。")
+            _d_print("ERROR: 无法向引擎发送 'position' 或 'go' 命令。")
             raise
 
         bestmove = None
         timeout = (movetime / 1000) + 5.0
         start_time = time.time()
-        print("正在等待引擎计算最佳走法...")
+        _d_print("正在等待引擎计算最佳走法...")
 
         while time.time() - start_time < timeout:
             for event in pygame.event.get():
@@ -757,14 +922,14 @@ class AutoChessPlayer:
                         score_val = int(parts[score_idx + 2])
                     if depth and score_type and score_val is not None:
                         self.display.update_engine_info(depth, score_val, score_type)
-                        self.display.draw_captured_board(self.last_board_state, self.is_running)
+                        self.display.draw_captured_board(self.last_board_state, self.dark_piece_library, self.is_running)
                 except (ValueError, IndexError): pass
 
             elif output.startswith("bestmove"):
                 bestmove = output.split(" ")[1]
-                print(f"引擎已找到最佳走法: {bestmove}")
+                _d_print(f"引擎已找到最佳走法: {bestmove}")
                 self.display.update_engine_info("", "", "")
-                self.display.draw_captured_board(self.last_board_state, self.is_running)
+                self.display.draw_captured_board(self.last_board_state, self.dark_piece_library, self.is_running)
                 break
             elif not output and self.engine and self.engine.poll() is not None:
                 self.engine = None
@@ -782,13 +947,16 @@ class AutoChessPlayer:
 
     def reset_game(self):
         """重置游戏变量并准备等待新游戏。"""
-        print("\n游戏结束或检测到错误。正在重置并等待新游戏...")
+        _d_print("\n游戏结束或检测到错误。正在重置并等待新游戏...")
         self.move_notations.clear()
         self.current_player, self.computer_side = 'r', None
-        self.last_board_state, self.initial_fen = None, None
+        self.last_board_state = None
         self.board_history.clear()
         self.game_state = "WAITING_FOR_NEW_GAME"
         self.display.update_engine_info("", "", "")
+        
+        self.dark_piece_library = self.initial_dark_pool.copy()
+        _d_print("暗子库已重置为初始状态。")
         
         ready_timeout = 5
         try:
@@ -800,57 +968,62 @@ class AutoChessPlayer:
                     raise EngineCommunicationError("引擎在ucinewgame后未准备就绪。")
                 time.sleep(0.1)
         except EngineCommunicationError as e:
-            print(f"引擎通信错误: {e}，尝试重新初始化引擎。")
+            _d_print(f"引擎通信错误: {e}，尝试重新初始化引擎。")
             try:
                 self.init_engine()
-                print("引擎重新初始化成功。")
+                _d_print("引擎重新初始化成功。")
             except EngineCommunicationError as re_init_e:
-                print(f"FATAL: 引擎重新初始化失败: {re_init_e}。")
+                _d_print(f"FATAL: 引擎重新初始化失败: {re_init_e}。")
                 self.game_over = True
                 return
             
-        print("游戏状态重置完成。现在等待新游戏。")
+        _d_print("游戏状态重置完成。现在等待新游戏。")
 
     def run(self):
-
+        """主循环"""
         while not self.game_over:
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     self.game_over = True
                     break
                 if event.type == pygame.MOUSEBUTTONDOWN:
-                    if self.display.settings_button_rect.collidepoint(event.pos):
-                        print("\n[界面操作] “设置”按钮被按下。")
-                        # 重新加载设置，以防用户修改了文件但未重启
+
+                    if self.display.handle_dark_piece_library_click(event.pos, self.dark_piece_library):
+                        _d_print(f"手动调整暗子库: {self.dark_piece_library}")
+                        pass
+
+                    elif self.display.settings_button_rect.collidepoint(event.pos):
+                        _d_print("\n[界面操作] “设置”按钮被按下。")
                         self.settings = load_settings()
                         show_settings_window(self.settings)
-                        # 再次加载，以应用窗口中所做的更改
                         self.settings = load_settings()
-                        print("设置窗口已关闭。")
+                        _d_print("设置窗口已关闭。")
 
                     elif self.display.connect_button_rect.collidepoint(event.pos):
                         if self.is_running:
-                            print("\n[界面操作] “重启”按钮被按下。正在重置游戏状态...")
-                            self.is_running = False # 停止逻辑循环以便重置
+                            _d_print("\n[界面操作] “重启”按钮被按下。正在重置游戏状态...")
+                            self.is_running = False
                             try: self.reset_game()
                             except EngineCommunicationError:
-                                print("错误：无法重启游戏，引擎通信失败。程序将退出。")
+                                _d_print("错误：无法重启游戏，引擎通信失败。程序将退出。")
                                 self.game_over = True
                         else:
-                            print("\n[界面操作] “连线”按钮被按下。正在启动自动对弈...")
+                            _d_print("\n[界面操作] “连线”按钮被按下。正在启动自动对弈...")
                             self.is_running = True
                             try: self.reset_game()
                             except EngineCommunicationError:
-                                print("错误：无法启动游戏，引擎通信失败。程序将退出。")
+                                _d_print("错误：无法启动游戏，引擎通信失败。程序将退出。")
                                 self.game_over = True
             if self.game_over: break
 
             if self.is_running:
                 try:
                     if self.game_state == "WAITING_FOR_NEW_GAME":
-                        print("\r正在搜索新的、合法的游戏棋盘...", end="", flush=True)
+                        _d_print("\r正在搜索新的、合法的游戏棋盘...", end="", flush=True)
                         current_board = self.get_board_state_from_screen()
-                        self.display.draw_captured_board(current_board, self.is_running)
+                        # 在等待时，也保持界面上的暗子库显示为最新状态
+                        if self.last_board_state is None:
+                            self.display.draw_captured_board(current_board, self.dark_piece_library, self.is_running)
 
                         if self.is_board_state_valid(current_board):
                             dark_piece_count = sum(1 for r in current_board for p in r if p and 'X' in p)
@@ -861,143 +1034,166 @@ class AutoChessPlayer:
                             
                             if found_red_king_at_bottom:
                                 self.computer_side, side_determined = 'r', True
-                                print("\n执棋方已确定: 电脑执红 (将帅在底部)。")
+                                _d_print("\n执棋方已确定: 电脑执红 (将帅在底部)。")
                             elif found_black_king_at_bottom:
                                 self.computer_side, side_determined = 'b', True
-                                print("\n执棋方已确定: 电脑执黑 (将帅在底部，棋盘已翻转)。")
+                                _d_print("\n执棋方已确定: 电脑执黑 (将帅在底部，棋盘已翻转)。")
                             elif dark_piece_count == 32:
                                 self.computer_side, side_determined = 'r', True
-                                print("\n检测到所有棋子面朝下。默认为电脑执红。")
+                                _d_print("\n检测到所有棋子面朝下。默认为电脑执红。")
                             
                             if side_determined:
+                                # --- NEW: 根据识别到的棋盘，计算并设置初始暗子库 ---
+                                self.update_library_from_board(current_board)
+                                # --- END NEW ---
+
                                 self.last_board_state = current_board
                                 self.board_history.append(current_board)
                                 self.current_player = 'r'
-                                self.initial_fen = self.board_state_to_jieqi_fen(current_board)
-                                print(f"初始FEN已设置: {self.initial_fen}")
                                 
                                 if self.computer_side == 'b':
                                     self.game_state = "HYPOTHESIZE_BLACK_TURN"
-                                    print("检测到执黑方，进入先手假设模式。")
+                                    _d_print("检测到执黑方，进入先手假设模式。")
                                 else:
                                     self.game_state = "PLAYING"
-                                    print("新游戏开始。进入对战模式。")
+                                    _d_print("新游戏开始。进入对战模式。")
                         time.sleep(2)
 
                     elif self.game_state == "HYPOTHESIZE_BLACK_TURN":
-                        print("\n[执黑方] 检测到新局面，假设对手已走，尝试我方先行...")
-                        fen_parts = self.initial_fen.split(' '); fen_parts[1] = 'b'
-                        hypothetical_fen = ' '.join(fen_parts)
-                        engine_move = self.get_engine_move(override_fen=hypothetical_fen)
+                        _d_print("\n[执黑方] 检测到新局面，假设对手已走，尝试我方先行...")
                         
+                        # 在黑方假设先行时，需要临时将走棋方设置为 'b' 来生成正确的FEN
+                        original_player = self.current_player
+                        self.current_player = 'b'
+                        engine_move = self.get_engine_move()
+                        self.current_player = original_player # 恢复
+
                         if not engine_move or engine_move == "(none)":
                             self.game_state = "PLAYING"
                             continue
 
                         board_before_move = self.last_board_state
-                        self.simulate_move_on_screen(engine_move)
+                        self.perform_move_on_screen(engine_move)
                         
-                        hypothesis_outcome, final_board_state, detected_uci_move = 'timeout', None, None
                         start_time = time.time()
                         while time.time() - start_time < 4.0:
-                            current_board = self._capture_single_frame()
+                            current_board = self.get_board_state_from_screen()
                             if current_board != board_before_move:
-                                stable_board = self.get_board_state_from_screen()
-                                move_tuple = self.compare_boards(board_before_move, stable_board)
+                                move_tuple = self.compare_boards(board_before_move, current_board)
                                 if move_tuple:
-                                    final_board_state, detected_uci_move = stable_board, self.move_to_uci(*move_tuple)
-                                    hypothesis_outcome = 'success' if detected_uci_move[:4] == engine_move[:4] else 'opponent_moved'
+                                    detected_uci_move = self.move_to_uci(*move_tuple)
+                                    # --- LOGIC CHANGE START ---
+                                    # 如果检测到翻子，立即更新暗子库
+                                    if move_tuple[4]:
+                                        revealed_piece_pos = (move_tuple[2], move_tuple[3])
+                                        piece_key = current_board[revealed_piece_pos[0]][revealed_piece_pos[1]]
+                                        self._handle_piece_reveal(piece_key)
+                                    # --- LOGIC CHANGE END ---
+                                    
+                                    self.move_notations.append(detected_uci_move)
+                                    self.last_board_state = current_board
+                                    self.board_history.append(current_board)
+                                    
+                                    # 判断是我方走棋成功还是对方抢先了
+                                    if detected_uci_move[:4] == engine_move[:4]:
+                                        _d_print(f"假设成功！我方走法 {detected_uci_move} 已确认。")
+                                        self.current_player = 'r'
+                                    else:
+                                        _d_print(f"假设失败！对手抢先移动: {detected_uci_move}")
+                                        self.current_player = 'b' # 对手走了，轮到我了
+                                    
                                     break
                             time.sleep(0.1)
-
-                        if hypothesis_outcome == 'success':
-                            print(f"假设成功！我方走法 {detected_uci_move} 已确认。")
-                            self.move_notations.append(detected_uci_move)
-                            self.last_board_state = final_board_state
-                            self.current_player = 'r'
-                        elif hypothesis_outcome == 'opponent_moved':
-                            print(f"假设失败！对手抢先移动: {detected_uci_move}")
-                            self.move_notations.append(detected_uci_move)
-                            self.last_board_state = final_board_state
-                            self.current_player = 'b'
-                        else:
-                            print("假设失败！我方走法未生效或超时，转为正常监控。")
-                            self.current_player = 'r'
                         
-                        self.board_history.append(self.last_board_state)
                         self.game_state = "PLAYING"
+
 
                     elif self.game_state == "PLAYING":
                         if self.current_player == self.computer_side:
-                            print("\n--- 电脑回合 ---")
+                            _d_print("\n--- 电脑回合 ---")
                             engine_move = self.get_engine_move()
                             if not engine_move or engine_move == "(none)":
                                 self.reset_game(); continue
                             
                             board_before_move = self.last_board_state
-                            self.simulate_move_on_screen(engine_move)
+                            self.perform_move_on_screen(engine_move)
                             
-                            board_after_our_move, corrected_uci_move = None, None
+                            # 确认我方走棋是否成功
+                            board_after_our_move = None
                             start_time = time.time()
+                            time.sleep(self.settings['board_click_interval']) # 等待点击生效
                             while time.time() - start_time < 5.0:
-                                snapshot = self._capture_single_frame()
+                                snapshot = self.get_board_state_from_screen()
                                 if snapshot != board_before_move:
                                     move_tuple = self.compare_boards(board_before_move, snapshot)
                                     if move_tuple:
-                                        detected_uci = self.move_to_uci(*move_tuple)
-                                        if detected_uci[:4] == engine_move[:4]:
-                                            board_after_our_move = self.get_board_state_from_screen()
-                                            final_tuple = self.compare_boards(board_before_move, board_after_our_move)
-                                            corrected_uci_move = self.move_to_uci(*final_tuple) if final_tuple else detected_uci
-                                            break
+                                        # --- LOGIC CHANGE START ---
+                                        # 如果我方走法是翻子，则更新暗子库
+                                        if move_tuple[4]:
+                                            revealed_pos = (move_tuple[2], move_tuple[3])
+                                            piece_key = snapshot[revealed_pos[0]][revealed_pos[1]]
+                                            self._handle_piece_reveal(piece_key)
+                                        # --- LOGIC CHANGE END ---
+                                        
+                                        corrected_uci_move = self.move_to_uci(*move_tuple)
+                                        board_after_our_move = snapshot
+                                        _d_print(f"最终确认我方走法: {corrected_uci_move}")
+                                        self.move_notations.append(corrected_uci_move)
+                                        break
                                 time.sleep(0.1)
 
                             if board_after_our_move:
-                                print(f"最终确认走法: {corrected_uci_move}")
-                                self.display.draw_captured_board(board_after_our_move, self.is_running)
+                                self.display.draw_captured_board(board_after_our_move, self.dark_piece_library, self.is_running)
                                 self.last_board_state = board_after_our_move
                                 self.board_history.append(board_after_our_move)
-                                self.move_notations.append(corrected_uci_move)
                                 self.current_player = 'b' if self.current_player == 'r' else 'r'
                             else:
-                                print("错误：未能确认我方走法。尝试重置游戏。")
+                                _d_print("错误：未能确认我方走法。尝试重置游戏。")
                                 self.reset_game()
                         else: 
-                            print("\r--- 对手回合: 监控中 ---", end="", flush=True)
+                            _d_print("\r--- 对手回合: 监控中 ---", end="", flush=True)
                             new_board_state = self.get_board_state_from_screen()
-                            self.display.draw_captured_board(new_board_state, self.is_running)
-
+                            
                             if new_board_state != self.last_board_state:
-                                print()
+                                _d_print() # 换行
                                 if not self.is_board_state_valid(new_board_state):
-                                    time.sleep(1); continue
-
+                                    time.sleep(1)
+                                    continue
+                                    
                                 move = self.compare_boards(self.last_board_state, new_board_state)
                                 if move:
+                                    # 如果对手的走法是翻子，则更新暗子库
+                                    if move[4]:
+                                        revealed_pos = (move[2], move[3])
+                                        piece_key = new_board_state[revealed_pos[0]][revealed_pos[1]]
+                                        self._handle_piece_reveal(piece_key)
+                                    
                                     uci_move = self.move_to_uci(*move)
-                                    print(f"检测到对手走法: {uci_move}")
+                                    _d_print(f"检测到对手走法: {uci_move}")
                                     self.move_notations.append(uci_move)
                                     self.last_board_state = new_board_state
                                     self.board_history.append(new_board_state)
                                     self.current_player = 'b' if self.current_player == 'r' else 'r'
                                 else: 
-                                    print("\n检测到无法识别的棋盘变化，尝试重置游戏。")
-                                    self.last_board_state = new_board_state
+                                    _d_print("\n检测到无法识别的棋盘变化，尝试重置游戏。")
+                                    self.last_board_state = new_board_state # 更新状态以避免循环重置
                                     self.reset_game()
-                            else:
-                                time.sleep(self.settings['fixed_scan_interval'])
+                            
+                            # 界面实时更新，即使棋盘没变化
+                            self.display.draw_captured_board(new_board_state, self.dark_piece_library, self.is_running)
+                            time.sleep(self.settings['fixed_scan_interval'])
 
                 except EngineCommunicationError as e:
-                    print(f"\n[致命错误] 引擎通信失败: {e}。")
+                    _d_print(f"\n[错误] 引擎通信失败: {e}。")
                     self.reset_game()
                     if self.game_over: break
                 except Exception as e:
-                    print(f"\n在对战中发生未知错误: {e}。尝试重置。")
+                    _d_print(f"\n在对战中发生错误: {e}。尝试重置。")
                     self.reset_game()
             
             else:
                 current_board = self._capture_single_frame()
-                self.display.draw_captured_board(current_board, self.is_running)
+                self.display.draw_captured_board(current_board, self.dark_piece_library, self.is_running)
                 time.sleep(0.1)
 
         if self.engine:
@@ -1006,17 +1202,31 @@ class AutoChessPlayer:
             finally:
                 if self.engine and self.engine.poll() is None:
                     self.engine.terminate()
+    
         pygame.quit()
-        print("引擎已关闭。程序退出。")
+        _d_print("引擎已关闭。程序退出。")
 
 if __name__ == "__main__":
-    roi = select_board_roi()
-    if roi:
-        print(f"棋盘区域已选定: {roi}")
-        player = AutoChessPlayer(roi)
-        
-        if not player.find_game_window():
-             print("\n未能找到有效的游戏窗口句柄，程序即将退出。")
-             sys.exit(1)
-             
-        player.run()
+
+    settings = load_settings()
+    if settings.get("debug_mode", 0) == 1:
+        DEBUG_ENABLED = True
+    else:
+        # 如果关闭调试模式，将标准错误流重定向到空设备以抑制所有错误消息
+        sys.stderr = NullWriter()
+
+    try:
+        roi = select_board_roi()
+        if roi:
+            _d_print(f"棋盘区域已选定: {roi}")
+            player = AutoChessPlayer(roi)
+            
+            if not player.find_game_window():
+                 _d_print("\n未能找到有效的游戏窗口句柄，程序即将退出。")
+                 sys.exit(1)
+                 
+            player.run()
+    except Exception as e:
+        # 捕获所有未处理的异常，仅在调试模式下打印
+        _d_print(f"程序发生错误: {e}")
+        sys.exit(1)
